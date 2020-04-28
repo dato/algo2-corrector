@@ -63,6 +63,7 @@ def parse_args():
         default=ENTREGAS_REPO,
         help="ruta a un checkout de algoritmos-rw/algo2_entregas",
     )
+    parser.add_argument("--pull-entregas", action="store_true")
     return parser.parse_args()
 
 
@@ -74,9 +75,6 @@ USERNAMES = {
     "105147": "juancebarberis",
     "105296": "nazaquintero",
 }
-
-
-# TODO: usar bare repos?
 
 
 def overwrite_files(repo, tree, subdir=""):
@@ -197,7 +195,6 @@ def update_repo(branch, subdir, upstream):
             committer=author,
             commit_date=authored_date,
         )
-        # XXX
         repo.index.reset(working_tree=True)
 
 
@@ -220,6 +217,11 @@ def main():
     except git.exc.InvalidGitRepositoryError as ex:
         print(f"could not open entregas_repo at {repodir!r}: {ex}", file=sys.stderr)
         return 1
+
+    if args.pull_entregas:
+        print(f"Pulling from {args.entregas_repo}")
+        remote = tprepo.remote()
+        remote.pull()
 
     for repo in args.repos:
         legajo = os.path.basename(repo)  # XXX: Drop this
