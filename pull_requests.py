@@ -1,7 +1,21 @@
 #!/usr/bin/python3
 
+"""Script/módulo para sincronizar las entregas con repositorios individuales.
+
+Uso como script:
+
+  $ ./pull_requests.py --tp <TP_ID> <alurepo>...
+
+donde TP_ID es el TP a sincronizar ("tp0", "vector", etc.). Se puede
+especificar la ubicación del checkout de algoritmos-rw/algo2_entregas
+con la opción --entregas-repo.
+"""
+
+import argparse
+import datetime
 import io
 import os
+import pathlib
 import sys
 
 import git
@@ -14,13 +28,43 @@ from git.index.typ import BaseIndexEntry
 from gitdb.base import IStream
 
 
-# TODO: do not hardcode these
-TP = "tp0"
-CUAT = "2020_1"
+# Default si no se pasa uno por línea de comandos.
+ENTREGAS_REPO = os.path.expanduser("~/fiuba/tprepo")
 
-# TODO: accept command line options
-TPREPO = os.path.expanduser("~/fiuba/tprepo")
-ALUREPO = os.path.expanduser("~/fiuba/alurepo")
+# Default si no se especifica con --cuatri.
+CUATRIMESTRE = "2020_1"
+
+
+def parse_args():
+    """Parse command line options and arguments.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "repos",
+        metavar="alurepo",
+        nargs="+",
+        help="repositorio nombrado con el legajo asociado",
+    )
+    parser.add_argument(
+        "--tp",
+        metavar="TP_ID",
+        required=True,
+        help="identificador del TP (dobla como nombre de rama)",
+    )
+    parser.add_argument(
+        "--cuatri",
+        metavar="YYYY_N",
+        default=CUATRIMESTRE,
+        help="cuatrimestre para el que buscar entregas en el repo",
+    )
+    parser.add_argument(
+        "--entregas-repo",
+        metavar="PATH",
+        default=ENTREGAS_REPO,
+        help="ruta a un checkout de algoritmos-rw/algo2_entregas",
+    )
+    return parser.parse_args()
+
 
 # TODO: DEFINITELY do not hardcode these
 USERNAMES = {
@@ -90,37 +134,40 @@ def merged_entries(old_traversal, new_traversal):
     return merged_entries
 
 
-def update_repo(legajo, repo):
-    """Actualiza el repositorio correspondiente a un legajo.
+def update_repo(branch, subdir, upstream):
+    """Actualiza un subdirectorio con archivos de otro repo.
 
-    La función examina las entregas en el repositorio global de entregas,
-    y aplica las faltantes al repositorio destino.
+    La función examina los commits en el upstream, y aplica los faltantes
+    en la rama destina.
+
+    TODO: Explicar (y mejorar) cómo se detecta qué falta.
 
     Args:
-      legajo (string): el legado correspondiente al repositorio
-      repo (git.Repo): el repositorio destino
+      branch (git.Branch): la rama donde aplicar las actualizaciones
+      subdir (str): el subdirectorio particular a sincronizar con upstream
+      upstream (Path): ruta en repo externo con los archivos actualizados
     """
-    print(f"Processing {legajo}")
-    tprepo = git.Repo(TPREPO)
-    tppath = f"{TP}/{CUAT}/{legajo}"
-    branch = get_branch(repo, TP)
+    repo = branch.repo
     newest_in_repo = branch.commit.authored_date
     pending_commits = []
 
-    for commit in tprepo.iter_commits(paths=[tppath]):
+    upstream_repo = git.Repo(upstream, search_parent_directories=True)
+    upstream_relpath = upstream.relative_to(upstream_repo.working_dir).as_posix()
+
+    print(f"Processing {repo.working_dir}...", end=" ")
+
+    for commit in upstream_repo.iter_commits(paths=[upstream_relpath]):
         if commit.authored_date > newest_in_repo:  # XXX Not robust enough.
             pending_commits.append(commit)
 
     if not pending_commits:
-        print(f"Nothing to do for {legajo}/{TP}", file=sys.stderr)
-        # XXX
-        repo.index.reset(working_tree=True)
+        print(f"nothing to do")
         return
-    else:
-        n = len(pending_commits)
-        print(f"Applying {n} commits to {legajo}/{TP}", file=sys.stderr)
 
     index = repo.index
+    legajo = os.path.basename(repo.working_dir)  # XXX Drop this
+    print(f"applying {len(pending_commits)} commit(s)")
+
     try:
         ghuser = USERNAMES[legajo]
     except KeyError:
@@ -133,8 +180,8 @@ def update_repo(legajo, repo):
 
     for commit in reversed(pending_commits):
         # Objeto Tree con los archivos de la entrega.
-        entrega_tree = commit.tree.join(tppath)
-        updated_tree = overwrite_files(repo, entrega_tree, TP)
+        entrega_tree = commit.tree.join(upstream_relpath)
+        updated_tree = overwrite_files(repo, entrega_tree, subdir)
 
         tz_hours = commit.author_tz_offset // 3600
         tz_minutes = commit.author_tz_offset % 3600 // 60
@@ -150,7 +197,6 @@ def update_repo(legajo, repo):
             committer=author,
             commit_date=authored_date,
         )
-
         # XXX
         repo.index.reset(working_tree=True)
 
@@ -164,19 +210,30 @@ def get_branch(repo, branch_name):
 
 
 def main():
-    for repodir in os.listdir(ALUREPO):
-        path = os.path.join(ALUREPO, repodir)
+    """Función principal del script (no invocada si se importa como módulo).
+    """
+    args = parse_args()
+    entregas_base = pathlib.Path(args.entregas_repo) / args.tp / args.cuatri
+
+    try:
+        tprepo = git.Repo(args.entregas_repo)
+    except git.exc.InvalidGitRepositoryError as ex:
+        print(f"could not open entregas_repo at {repodir!r}: {ex}", file=sys.stderr)
+        return 1
+
+    for repo in args.repos:
+        legajo = os.path.basename(repo)  # XXX: Drop this
         try:
-            repo = git.Repo(path)
+            repo = git.Repo(repo)
         except git.exc.InvalidGitRepositoryError as ex:
-            print(f"could not open {repodir!r}: {ex}", file=sys.stderr)
+            print(f"could not open {repo!r}: {ex}", file=sys.stderr)
         else:
             # TODO: opportunistically return pull request URL.
-            update_repo(repodir, repo)
+            update_repo(get_branch(repo, args.tp), args.tp, entregas_base / legajo)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
 # Local Variables:
 # eval: (blacken-mode 1)
