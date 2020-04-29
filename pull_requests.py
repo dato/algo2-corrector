@@ -4,21 +4,26 @@
 
 Uso como script:
 
-  $ ./pull_requests.py --tp <TP_ID> <alurepo>...
+  $ ./pull_requests.py --tp <TP_ID> <legajo>...
 
 donde TP_ID es el TP a sincronizar ("tp0", "vector", etc.). Se puede
 especificar la ubicación del checkout de algoritmos-rw/algo2_entregas
-con la opción --entregas-repo.
+con la opción --entregas-repo, y la ubicación de los repositorios
+individuales con --alu-repodir. fiubatp.tsv debe estar presente en el
+directorio actual, o especificarse con --planilla.
+
+Uso como módulo: llamar a update_repo() indicando el TP, la ruta a la
+entrega, y el directorio con los repositorios individuales.
 """
 
 import argparse
-import datetime
+import csv
 import io
 import os
 import pathlib
 import sys
 
-import git
+import git  # apt install python3-git
 import git.index.fun as indexfun
 import git.objects.fun as objfun
 
@@ -28,11 +33,59 @@ from git.index.typ import BaseIndexEntry
 from gitdb.base import IStream
 
 
-# Default si no se pasa uno por línea de comandos.
+# Defaults si no se ajustan por la línea de comandos.
 ENTREGAS_REPO = os.path.expanduser("~/fiuba/tprepo")
+ALU_REPOS_DIR = os.path.expanduser("~/fiuba/alurepo")
 
 # Default si no se especifica con --cuatri.
 CUATRIMESTRE = "2020_1"
+
+
+## Función principal para corrector.py
+##
+def update_repo(tp_id, repodir, upstream, planilla_tsv, silent=True):
+    """Importa la última versión de una entrega a un repositorio individual.
+
+    Args:
+      tp_id (str): identificador del TP (dobla como subdirectorio y rama)
+      repodir (Path): ruta al repositorio destino (se clona si no existe)
+      upstream (Path): ruta en repo externo con los archivos actualizados
+      planilla_file (str): hoja "fiubatp" de la planilla exportada en TSV
+    """
+    legajo = repodir.name  # Siempre cumplimos que `basename $REPO` == legajo.
+    alu_dict = None
+
+    # Buscar legajo en la "planilla".
+    with open(planilla_tsv, newline="") as fileobj:
+        for row in csv.DictReader(fileobj, dialect="excel-tab"):
+            if row["Legajo"] == legajo:
+                alu_dict = row
+                break
+        else:
+            if not silent:
+                # Demasiado spam si la planilla solo tiene los legajos habilitados.
+                print(f"no se pudo encontrar legajo {legajo} en {planilla_tsv}")
+            return
+
+    # Sanity checks.
+    if not alu_dict.get("Github"):
+        print(f"no se pudo encontrar cuenta de Github para {legajo}")
+        return
+    elif not repodir.exists() and not alu_dict.get("Repo"):
+        print(f"no se pudo encontrar repo URL para {legajo}")
+        return
+
+    if not repodir.exists():
+        git.Repo.clone_from("git@github.com:" + alu_dict["Repo"], repodir)
+
+    try:
+        repo = git.Repo(repodir)
+    except git.exc.InvalidGitRepositoryError as ex:
+        print(f"could not open {repodir!r}: {ex}", file=sys.stderr)
+    else:
+        # TODO: opportunistically return pull request URL.
+        branch = get_or_checkout_branch(repo, tp_id)
+        update_branch(branch, tp_id, upstream, alu_dict["Github"])
 
 
 def parse_args():
@@ -40,8 +93,8 @@ def parse_args():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "repos",
-        metavar="alurepo",
+        "legajos",
+        metavar="legajo",
         nargs="+",
         help="repositorio nombrado con el legajo asociado",
     )
@@ -58,6 +111,18 @@ def parse_args():
         help="cuatrimestre para el que buscar entregas en el repo",
     )
     parser.add_argument(
+        "--planilla",
+        metavar="TSV_FILE",
+        default="fiubatp.tsv",
+        help="archivo TSV con los contenidos de la hoja 'fiubatp'",
+    )
+    parser.add_argument(
+        "--alu-repodir",
+        metavar="PATH",
+        default=ALU_REPOS_DIR,
+        help="directorio con los repositorios individuales",
+    )
+    parser.add_argument(
         "--entregas-repo",
         metavar="PATH",
         default=ENTREGAS_REPO,
@@ -65,16 +130,6 @@ def parse_args():
     )
     parser.add_argument("--pull-entregas", action="store_true")
     return parser.parse_args()
-
-
-# TODO: DEFINITELY do not hardcode these
-USERNAMES = {
-    "103457": "tomascosta3",
-    "103740": "milognr",
-    "104302": "angysaavedra",
-    "105147": "juancebarberis",
-    "105296": "nazaquintero",
-}
 
 
 def overwrite_files(repo, tree, subdir=""):
@@ -132,11 +187,11 @@ def merged_entries(old_traversal, new_traversal):
     return merged_entries
 
 
-def update_repo(branch, subdir, upstream):
-    """Actualiza un subdirectorio con archivos de otro repo.
+def update_branch(branch, subdir, upstream, ghuser):
+    """Actualiza una rama con archivos de otro repo.
 
     La función examina los commits en el upstream, y aplica los faltantes
-    en la rama destina.
+    en la rama destino.
 
     TODO: Explicar (y mejorar) cómo se detecta qué falta.
 
@@ -144,6 +199,7 @@ def update_repo(branch, subdir, upstream):
       branch (git.Branch): la rama donde aplicar las actualizaciones
       subdir (str): el subdirectorio particular a sincronizar con upstream
       upstream (Path): ruta en repo externo con los archivos actualizados
+      ghuser (str): nombre de cuenta de Github con que crear los commits.
     """
     repo = branch.repo
     newest_in_repo = branch.commit.authored_date
@@ -162,19 +218,10 @@ def update_repo(branch, subdir, upstream):
         print(f"nothing to do")
         return
 
-    index = repo.index
-    legajo = os.path.basename(repo.working_dir)  # XXX Drop this
     print(f"applying {len(pending_commits)} commit(s)")
 
-    try:
-        ghuser = USERNAMES[legajo]
-    except KeyError:
-        print(f"No username for {legajo}", file=sys.stderr)
-        return
-    else:
-        author = git.Actor(ghuser, f"{ghuser}@users.noreply.github.com")
-
     branch.checkout()
+    author = git.Actor(ghuser, f"{ghuser}@users.noreply.github.com")
 
     for commit in reversed(pending_commits):
         # Objeto Tree con los archivos de la entrega.
@@ -198,19 +245,29 @@ def update_repo(branch, subdir, upstream):
         repo.index.reset(working_tree=True)
 
 
-def get_branch(repo, branch_name):
+def get_or_checkout_branch(repo, branch_name):
     """Dado un repo, devolver la rama con ese nombre.
+
+    Si la rama no existe, se crea a partir de una rama remota llamada igual
+    o de la rama master local.
     """
-    for branch in repo.branches:
-        if branch.name == branch_name:
-            return branch
+    for args in [], ["-t", f"origin/{branch_name}"], ["-b", branch_name, "master"]:
+        if args:
+            try:
+                repo.git.checkout(args)
+            except git.exc.GitCommandError:
+                pass
+        for branch in repo.branches:
+            if branch.name == branch_name:
+                return branch
 
 
 def main():
     """Función principal del script (no invocada si se importa como módulo).
     """
     args = parse_args()
-    entregas_base = pathlib.Path(args.entregas_repo) / args.tp / args.cuatri
+    repodir = pathlib.Path(args.alu_repodir)
+    entregas_repo = pathlib.Path(args.entregas_repo)
 
     try:
         tprepo = git.Repo(args.entregas_repo)
@@ -223,15 +280,16 @@ def main():
         remote = tprepo.remote()
         remote.pull()
 
-    for repo in args.repos:
-        legajo = os.path.basename(repo)  # XXX: Drop this
-        try:
-            repo = git.Repo(repo)
-        except git.exc.InvalidGitRepositoryError as ex:
-            print(f"could not open {repo!r}: {ex}", file=sys.stderr)
+    for legajo in args.legajos:
+        alurepo = repodir / legajo
+        upstream = entregas_repo / args.tp / args.cuatri / legajo
+        if upstream.exists():
+            update_repo(args.tp, alurepo, upstream, args.planilla)
         else:
-            # TODO: opportunistically return pull request URL.
-            update_repo(get_branch(repo, args.tp), args.tp, entregas_base / legajo)
+            print(
+                f"no hay entrega para {upstream.relative_to(entregas_repo)}",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":
