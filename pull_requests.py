@@ -40,6 +40,8 @@ ALU_REPOS_DIR = os.path.expanduser("~/fiuba/alurepo")
 # Default si no se especifica con --cuatri.
 CUATRIMESTRE = "2020_1"
 
+# URLs para creación de pull request.
+PULLREQ_URL = "https://github.com/{repo}/compare/master...{branch}?quick_pull=1"
 
 ## Función principal para corrector.py
 ##
@@ -51,6 +53,9 @@ def update_repo(tp_id, repodir, upstream, planilla_tsv, silent=True):
       repodir (Path): ruta al repositorio destino (se clona si no existe)
       upstream (Path): ruta en repo externo con los archivos actualizados
       planilla_file (str): hoja "fiubatp" de la planilla exportada en TSV
+
+    Returns:
+      URL para crear pull request si la rama estaba previamente integrada.
     """
     legajo = repodir.name  # Siempre cumplimos que `basename $REPO` == legajo.
     alu_dict = None
@@ -245,21 +250,39 @@ def update_branch(branch, subdir, upstream, ghuser):
         repo.index.reset(working_tree=True)
 
 
-def get_or_checkout_branch(repo, branch_name):
+def get_or_checkout_branch(repo, branch_name, fast_forward=False):
     """Dado un repo, devolver la rama con ese nombre.
 
     Si la rama no existe, se crea a partir de una rama remota llamada igual
     o de la rama master local.
+
+    Args:
+      fast_forward (bool): si verdadero, hacer fast-forward desde la rama upstream.
     """
-    for args in [], ["-t", f"origin/{branch_name}"], ["-b", branch_name, "master"]:
-        if args:
+    upstream = f"origin/{branch_name}"
+    try:
+        branch = repo.branches[branch_name]
+    except IndexError:
+        # Hacer checkout desde remote o master.
+        for args in ["-t", upstream], ["-b", branch_name, "master"]:
             try:
                 repo.git.checkout(args)
             except git.exc.GitCommandError:
                 pass
-        for branch in repo.branches:
-            if branch.name == branch_name:
-                return branch
+            else:
+                return repo.branches[branch_name]
+
+    if fast_forward:
+        branch.checkout()
+        tracking = branch.tracking_branch()
+        if tracking:
+            upstream = tracking.name
+        try:
+            repo.git.merge(["--ff-only", upstream])
+        except git.exc.GitCommandError:
+            pass
+
+    return branch
 
 
 def main():
