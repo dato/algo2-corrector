@@ -85,12 +85,40 @@ def update_repo(tp_id, repodir, upstream, planilla_tsv, silent=True):
 
     try:
         repo = git.Repo(repodir)
-    except git.exc.InvalidGitRepositoryError as ex:
-        print(f"could not open {repodir!r}: {ex}", file=sys.stderr)
+        origin = repo.remotes["origin"]
+        origin.fetch()
+    except (git.exc.InvalidGitRepositoryError, git.exc.GitCommandError) as ex:
+        print(f"could not open/fetch {repodir!r}: {ex}", file=sys.stderr)
+        return
+
+    branch = get_or_checkout_branch(repo, tp_id, fast_forward=True)
+    pullreq_url = None
+    initial_commit = branch.commit
+
+    if not update_branch(branch, tp_id, upstream, alu_dict["Github"]):
+        return None
+
+    # Return a pull request URL if initial commit was merged in master.
+    if is_merged(initial_commit, "origin/master"):
+        repo_id = alu_dict["Repo"]  # XXX Technically could fail, see our sanity checks.
+        pullreq_url = PULLREQ_URL.format(repo=repo_id, branch=branch.name)
+        # TODO: Put this hack somewhere else.
+        apellido = repo_id.split("_")[-1].capitalize()
+        pullreq_url += f"&title=%5balgo2%5d%20%E2%80%93%20{tp_id}%20{apellido}"
+
+    try:
+        origin.push(branch.name)
+    except git.exc.GitCommandError as ex:
+        print(f"could not push {repodir!r}: {ex}", file=sys.stderr)
     else:
-        # TODO: opportunistically return pull request URL.
-        branch = get_or_checkout_branch(repo, tp_id)
-        update_branch(branch, tp_id, upstream, alu_dict["Github"])
+        return pullreq_url
+
+
+def is_merged(commit, branch_name):
+    branches = commit.repo.git.branch(
+        ["-a", "--format=%(refname:short)", "--contains", commit.hexsha]
+    )
+    return branch_name in branches.splitlines()
 
 
 def parse_args():
@@ -205,6 +233,9 @@ def update_branch(branch, subdir, upstream, ghuser):
       subdir (str): el subdirectorio particular a sincronizar con upstream
       upstream (Path): ruta en repo externo con los archivos actualizados
       ghuser (str): nombre de cuenta de Github con que crear los commits.
+
+    Returns:
+      True si se actualizó la rama, False si no se agregaron commits.
     """
     repo = branch.repo
     newest_in_repo = branch.commit.authored_date
@@ -221,7 +252,7 @@ def update_branch(branch, subdir, upstream, ghuser):
 
     if not pending_commits:
         print(f"nothing to do")
-        return
+        return False
 
     print(f"applying {len(pending_commits)} commit(s)")
 
@@ -248,6 +279,8 @@ def update_branch(branch, subdir, upstream, ghuser):
             commit_date=authored_date,
         )
         repo.index.reset(working_tree=True)
+
+    return True
 
 
 def get_or_checkout_branch(repo, branch_name, fast_forward=False):
